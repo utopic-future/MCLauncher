@@ -5,10 +5,14 @@ on:
     inputs:
       version:
         description: Minecraft version to package
-        default: '1.8.9'
+        default: '1.21.1'
         required: true
       include_java:
         description: Bundle the Java runtime required by this version
+        type: boolean
+        default: true
+      sodium:
+        description: Bake in Fabric Loader + Sodium (needs a version Sodium supports, e.g. 1.21.1)
         type: boolean
         default: true
 
@@ -55,6 +59,52 @@ jobs:
       - name: Bundle Java
         if: ${{ inputs.include_java }}
         run: cp -r "$(cygpath -u "$JAVA_HOME")" package/Minecraft/java
+
+      - name: Add Fabric and Sodium
+        if: ${{ inputs.sodium }}
+        run: |
+          UA="github-actions-minecraft-package/1.0 (${{ github.repository }})"
+          JQ="$PWD/package/Minecraft/tools/jq.exe"
+          jq() { "$JQ" "$@" | tr -d '\r'; }
+
+          loader=$(curl -fsSL -A "$UA" "https://meta.fabricmc.net/v2/versions/loader/$VERSION" \
+            | jq -r '[.[] | select(.loader.stable)][0].loader.version // empty')
+          installer=$(curl -fsSL -A "$UA" "https://meta.fabricmc.net/v2/versions/installer" \
+            | jq -r '[.[] | select(.stable)][0].version // empty')
+          [ -n "$loader" ] && [ -n "$installer" ] || { echo "Fabric does not support $VERSION"; exit 1; }
+
+          curl -fsSL -A "$UA" -o profile.json \
+            "https://meta.fabricmc.net/v2/versions/loader/$VERSION/$loader/$installer/profile/json"
+          id=$(jq -r '.id' profile.json)
+          mkdir -p "package/Minecraft/versions/$id"
+          mv profile.json "package/Minecraft/versions/$id/$id.json"
+          echo "Fabric profile: $id"
+
+          # Installs the Fabric profile (parent version is already there) and makes it the default
+          bash package/mclauncher-tui.sh --install "$id" "$PWD/package/Minecraft"
+
+          mods="package/Minecraft/instances/$id/mods"
+          mkdir -p "$mods"
+
+          # Downloads the newest release of a Modrinth project for $VERSION on Fabric,
+          # verifies its SHA-512, and prints the project's required dependencies.
+          fetch_mod() {
+            local v url sha
+            v=$(curl -fsSL -A "$UA" -G "https://api.modrinth.com/v2/project/$1/version" \
+                  --data-urlencode "game_versions=[\"$VERSION\"]" \
+                  --data-urlencode 'loaders=["fabric"]' \
+                | jq -c '([.[] | select(.version_type == "release")] + .)[0]')
+            if [ -z "$v" ] || [ "$v" = null ]; then echo "No Fabric build of $1 for $VERSION" >&2; return 1; fi
+            url=$(jq -r '.files | (map(select(.primary))[0] // .[0]).url' <<< "$v")
+            sha=$(jq -r '.files | (map(select(.primary))[0] // .[0]).hashes.sha512' <<< "$v")
+            curl -fsSL -A "$UA" -o "$mods/${url##*/}" "$url"
+            [ "$(sha512sum "$mods/${url##*/}" | cut -d' ' -f1)" = "$sha" ] || { echo "Hash mismatch for ${url##*/}" >&2; return 1; }
+            echo "Added ${url##*/}" >&2
+            jq -r '.dependencies[] | select(.dependency_type == "required" and .project_id != null) | .project_id' <<< "$v"
+          }
+
+          for dep in $(fetch_mod sodium); do fetch_mod "$dep" > /dev/null; done
+          ls -l "$mods"
 
       - name: Create zip
         run: |
